@@ -1,17 +1,19 @@
 import sys
 import queue
-import time
 import numpy as np
 import soundcard as sc
 import whisper
 from deep_translator import GoogleTranslator
-from PySide6.QtCore import Qt, QThread, Signal, Slot
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QPoint, QTimer
+from PySide6.QtGui import QFontMetrics, QFont
 from PySide6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
 
 # --- Configuration ---
 SAMPLE_RATE = 16000
 CHANNELS = 2  
 BLOCK_SIZE = int(SAMPLE_RATE * 1)  # 1-second audio chunks
+SILENCE_THRESHOLD = 0.015          # Volume below this is considered silence
+
 AUDIO_QUEUE = queue.Queue()
 
 
@@ -34,7 +36,8 @@ class AudioRecorderWorker(QThread):
             with loopback_mic.recorder(samplerate=SAMPLE_RATE, channels=CHANNELS) as recorder:
                 while self.is_running:
                     data = recorder.record(numframes=BLOCK_SIZE)
-                    
+                    if not self.is_running:
+                        break
                     if data is None or data.size == 0:
                         continue
                         
@@ -43,7 +46,7 @@ class AudioRecorderWorker(QThread):
                     else:
                         audio_data = data.flatten().astype(np.float32)
                     
-                    if audio_data.size > 0 and np.max(np.abs(audio_data)) >= 0.01:
+                    if audio_data.size > 0:
                         AUDIO_QUEUE.put(audio_data)
                         
         except Exception as e:
@@ -55,7 +58,7 @@ class AudioRecorderWorker(QThread):
 
 
 class TranscriptionWorker(QThread):
-    caption_ready = Signal(str, str)
+    caption_ready = Signal(str, str, bool)
 
     def __init__(self):
         super().__init__()
@@ -63,42 +66,64 @@ class TranscriptionWorker(QThread):
         self.model = whisper.load_model("tiny.en")
         self.translator = GoogleTranslator(source='en', target='zh-CN')
         self.is_running = True
+        self.phrase_buffer = []  
+        self.reset_requested = False # Thread-safe flag for clearing memory
+
+    def request_buffer_reset(self):
+        self.reset_requested = True
 
     def run(self):
         print("Transcriber and Translator ready...")
         while self.is_running:
             try:
-                audio_data = AUDIO_QUEUE.get(timeout=1)
+                # Safe state cleanup at the beginning of the cycle
+                if self.reset_requested:
+                    self.phrase_buffer.clear()
+                    self.reset_requested = False
+
+                chunk = AUDIO_QUEUE.get(timeout=1)
+                max_amplitude = np.max(np.abs(chunk))
                 
-                if audio_data is None or audio_data.size == 0:
-                    AUDIO_QUEUE.task_done()
-                    continue
-
-                en_result = self.model.transcribe(
-                    audio_data, 
-                    fp16=False, 
-                    language="en",
-                    task="transcribe",
-                    beam_size=1,
-                    best_of=1,
-                    temperature=0.0
-                )
-                en_text = en_result["text"].strip()
-
-                if en_text:
-                    try:
-                        zh_text = self.translator.translate(en_text)
-                    except Exception as tx_err:
-                        print(f"Translation Error: {tx_err}")
-                        zh_text = "[Translation Error]"
+                if max_amplitude >= SILENCE_THRESHOLD:
+                    self.phrase_buffer.append(chunk)
+                    combined_audio = np.concatenate(self.phrase_buffer)
                     
-                    self.caption_ready.emit(en_text, zh_text)
+                    en_text = self.transcribe_audio(combined_audio)
+                    if en_text:
+                        zh_text = self.translate_text(en_text)
+                        self.caption_ready.emit(en_text, zh_text, False)
+                        
+                else:
+                    if self.phrase_buffer:
+                        combined_audio = np.concatenate(self.phrase_buffer)
+                        final_en = self.transcribe_audio(combined_audio)
+                        if final_en:
+                            final_zh = self.translate_text(final_en)
+                            self.caption_ready.emit(final_en, final_zh, True)
+                        
+                        self.phrase_buffer.clear()
                 
                 AUDIO_QUEUE.task_done()
             except queue.Empty:
                 continue
             except Exception as e:
                 print(f"Transcription Error: {e}")
+
+    def transcribe_audio(self, audio_data):
+        try:
+            result = self.model.transcribe(
+                audio_data, fp16=False, language="en",
+                task="transcribe", beam_size=1, temperature=0.0
+            )
+            return result["text"].strip()
+        except Exception:
+            return ""
+
+    def translate_text(self, text):
+        try:
+            return self.translator.translate(text)
+        except Exception:
+            return "[Translation Error]"
 
     def stop(self):
         self.is_running = False
@@ -108,14 +133,22 @@ class TranscriptionWorker(QThread):
 class OverlayCaptionWindow(QWidget):
     def __init__(self):
         super().__init__()
-        self.en_history = []
-        self.zh_history = []
+        self.display_en = ""
+        self.display_zh = ""
+        self.drag_position = QPoint()
+        
+        self.clear_timer = QTimer(self)
+        self.clear_timer.setSingleShot(True)
+        self.clear_timer.timeout.connect(self.clear_captions)
         
         self.init_ui()
         
+        # Explicit font metric targets to run size checks completely off-screen safely
+        self.en_metrics = QFontMetrics(QFont('Segoe UI', 32, QFont.Bold))
+        self.zh_metrics = QFontMetrics(QFont('Microsoft YaHei', 28, QFont.Bold))
+        
         self.recorder = AudioRecorderWorker()
         self.transcriber = TranscriptionWorker()
-        
         self.transcriber.caption_ready.connect(self.update_captions)
         
         self.recorder.start()
@@ -124,29 +157,28 @@ class OverlayCaptionWindow(QWidget):
     def init_ui(self):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
 
         panel_layout = QVBoxLayout()
         panel_layout.setSpacing(4)  
         panel_layout.setContentsMargins(35, 10, 35, 10)
 
-        # Row 1: English Text
         self.en_label = QLabel("Listening...")
         self.en_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.en_label.setWordWrap(True)
-        self.en_label.setStyleSheet("color: #FFFFFF; font-size: 32px; font-weight: bold;")
+        self.en_label.setWordWrap(False) 
+        self.en_label.setStyleSheet("color: #FFFFFF; font-size: 32px; font-weight: bold; font-family: 'Segoe UI';")
 
-        # Row 2: Chinese Text
         self.zh_label = QLabel("正在等待音频...")
         self.zh_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
-        self.zh_label.setWordWrap(True)
-        self.zh_label.setStyleSheet("color: #FFCC00; font-size: 28px; font-weight: bold;")
+        self.zh_label.setWordWrap(False) 
+        self.zh_label.setStyleSheet("color: #FFCC00; font-size: 28px; font-weight: bold; font-family: 'Microsoft YaHei';")
 
         panel_layout.addWidget(self.en_label)
         panel_layout.addWidget(self.zh_label)
 
         self.container = QWidget(self)
         self.container.setLayout(panel_layout)
+        self.container.setCursor(Qt.OpenHandCursor)
         self.container.setStyleSheet("""
             QWidget {
                 background-color: rgba(15, 15, 15, 0.85);
@@ -156,7 +188,6 @@ class OverlayCaptionWindow(QWidget):
             QLabel {
                 background: transparent;
                 border: none;
-                font-family: 'Segoe UI', Arial, 'Microsoft YaHei', sans-serif;
             }
         """)
 
@@ -168,9 +199,7 @@ class OverlayCaptionWindow(QWidget):
 
     def resize_and_center(self):
         width = 1200
-        height = 160
-        
-        # FIX: Enforce absolute maximum sizes so text wrap cannot aggressively push the box larger
+        height = 130 
         self.setFixedSize(width, height)
         
         screen = QApplication.primaryScreen().geometry()
@@ -178,23 +207,62 @@ class OverlayCaptionWindow(QWidget):
         y = screen.height() - height - 60
         self.move(x, y)
 
-    @Slot(str, str)
-    def update_captions(self, en_text, zh_text):
-        self.en_history.append(en_text)
-        self.zh_history.append(zh_text)
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self.container.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() == Qt.LeftButton:
+            self.move(event.globalPosition().toPoint() - self.drag_position)
+            event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self.container.setCursor(Qt.OpenHandCursor)
+
+    @Slot(str, str, bool)
+    def update_captions(self, en_text, zh_text, is_final):
+        if not is_final:
+            self.clear_timer.stop()
+
+        max_allowed_width = self.en_label.width() - 50
         
-        if len(self.en_history) > 5:
-            self.en_history = [self.en_history[-1]]
-            self.zh_history = [self.zh_history[-1]]
+        text_width_en = self.en_metrics.horizontalAdvance(en_text)
+        text_width_zh = self.zh_metrics.horizontalAdvance(zh_text)
+        
+        # BUG FIX: Use a safe flag request method instead of calling .clear() directly on list memory
+        if text_width_en > max_allowed_width or text_width_zh > max_allowed_width:
+            self.transcriber.request_buffer_reset()
+            self.display_en = "..."
+            self.display_zh = "..."
+        else:
+            self.display_en = en_text
+            self.display_zh = zh_text
             
         self.render_history_text()
 
+        if is_final and (en_text or zh_text):
+            self.clear_timer.start(500)
+
+    @Slot()
+    def clear_captions(self):
+        self.display_en = ""
+        self.display_zh = ""
+        self.render_history_text()
+
     def render_history_text(self):
-        en_display = " ".join(self.en_history)
-        zh_display = " ".join(self.zh_history)
+        en_display = self.display_en if self.display_en else "Listening..."
+        zh_display = self.display_zh if self.display_zh else "正在等待音频..."
         
-        self.en_label.setText(en_display if en_display else "Listening...")
-        self.zh_label.setText(zh_display if zh_display else "正在等待音频...")
+        self.en_label.setText(en_display)
+        self.zh_label.setText(zh_display)
+
+    def closeEvent(self, event):
+        self.clear_timer.stop()
+        self.recorder.stop()
+        self.transcriber.stop()
+        event.accept()
 
 
 if __name__ == "__main__":
