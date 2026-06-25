@@ -1,4 +1,5 @@
 import sys
+import time
 import queue
 import numpy as np
 import soundcard as sc
@@ -46,7 +47,7 @@ class AudioRecorderWorker(QThread):
                         audio_data = data.flatten().astype(np.float32)
                     
                     if audio_data.size > 0:
-                        AUDIO_QUEUE.put(audio_data)
+                        AUDIO_QUEUE.put((audio_data, time.time()))
                         
         except Exception as e:
             print(f"Recorder Error: {e}")
@@ -56,57 +57,111 @@ class AudioRecorderWorker(QThread):
         self.wait()
 
 
+class TranslationWorker(QThread):
+    """Dedicated thread for network translation to prevent audio blocking."""
+    translation_ready = Signal(str, str, bool)
+
+    def __init__(self):
+        super().__init__()
+        self.translator = GoogleTranslator(source='en', target='zh-CN')
+        self.text_queue = queue.Queue()
+        self.is_running = True
+        self.last_translated_en = ""
+
+    @Slot(str, bool)
+    def queue_translation(self, en_text, is_final):
+        # Clear backed up intermediate translations so we only process the newest
+        if not is_final:
+            with self.text_queue.mutex:
+                self.text_queue.queue.clear()
+        self.text_queue.put((en_text, is_final))
+
+    def run(self):
+        print("Translator ready...")
+        while self.is_running:
+            try:
+                en_text, is_final = self.text_queue.get(timeout=0.1)
+                
+                # Skip the network call if the text hasn't actually changed
+                if en_text == self.last_translated_en and not is_final:
+                    self.text_queue.task_done()
+                    continue
+                    
+                try:
+                    zh_text = self.translator.translate(en_text)
+                    self.last_translated_en = en_text
+                except Exception:
+                    zh_text = "[Translation Error]"
+                
+                self.translation_ready.emit(en_text, zh_text, is_final)
+                self.text_queue.task_done()
+                
+                if is_final:
+                    self.last_translated_en = ""
+                    
+            except queue.Empty:
+                continue
+
+    def stop(self):
+        self.is_running = False
+        self.wait()
+
+
 class TranscriptionWorker(QThread):
-    caption_ready = Signal(str, str, bool)
+    text_ready = Signal(str, bool)
 
     def __init__(self):
         super().__init__()
         print("Loading Whisper model...")
         self.model = whisper.load_model("tiny.en")
-        self.translator = GoogleTranslator(source='en', target='zh-CN')
         self.is_running = True
         self.phrase_buffer = []  
-        self.reset_requested = False 
-
-    def request_buffer_reset(self):
-        self.reset_requested = True
+        self.last_en_text = ""
 
     def run(self):
-        print("Transcriber and Translator ready...")
+        print("Transcriber ready...")
         while self.is_running:
             try:
-                if self.reset_requested:
-                    self.phrase_buffer.clear()
-                    self.reset_requested = False
-
-                chunk = AUDIO_QUEUE.get(timeout=1)
+                payload = AUDIO_QUEUE.get(timeout=1)
+                chunk, record_time = payload
                 max_amplitude = np.max(np.abs(chunk))
                 
                 if max_amplitude >= SILENCE_THRESHOLD:
                     self.phrase_buffer.append(chunk)
-                    
-                    # ADDED: Check if buffer exceeds 20 blocks (20 seconds).
-                    # If so, drop old context to safeguard memory and stop model lag.
-                    if len(self.phrase_buffer) > 20:
-                        print("Buffer exceeded 20 seconds. Clearing old segments...")
-                        self.phrase_buffer = self.phrase_buffer[-1:] # Keep only the newest 1-second block
-                    
                     combined_audio = np.concatenate(self.phrase_buffer)
                     
                     en_text = self.transcribe_audio(combined_audio)
                     if en_text:
-                        zh_text = self.translate_text(en_text)
-                        self.caption_ready.emit(en_text, zh_text, False)
+                        processing_lag = time.time() - record_time
+                        
+                        if processing_lag > 2.0:
+                            print(f"Lag Alert ({processing_lag:.2f}s). Flushing backlog...")
+                            self.phrase_buffer.clear()
+                            
+                            # Drain the audio queue
+                            while not AUDIO_QUEUE.empty():
+                                try:
+                                    AUDIO_QUEUE.get_nowait()
+                                    AUDIO_QUEUE.task_done()
+                                except queue.Empty:
+                                    break
+                                    
+                            self.text_ready.emit(en_text, False)
+                        else:
+                            # Only emit to the translator if Whisper produced new words
+                            if en_text != self.last_en_text:
+                                self.last_en_text = en_text
+                                self.text_ready.emit(en_text, False)
                         
                 else:
                     if self.phrase_buffer:
                         combined_audio = np.concatenate(self.phrase_buffer)
                         final_en = self.transcribe_audio(combined_audio)
                         if final_en:
-                            final_zh = self.translate_text(final_en)
-                            self.caption_ready.emit(final_en, final_zh, True)
+                            self.text_ready.emit(final_en, True)
                         
                         self.phrase_buffer.clear()
+                        self.last_en_text = ""
                 
                 AUDIO_QUEUE.task_done()
             except queue.Empty:
@@ -123,12 +178,6 @@ class TranscriptionWorker(QThread):
             return result["text"].strip()
         except Exception:
             return ""
-
-    def translate_text(self, text):
-        try:
-            return self.translator.translate(text)
-        except Exception:
-            return "[Translation Error]"
 
     def stop(self):
         self.is_running = False
@@ -153,12 +202,18 @@ class OverlayCaptionWindow(QWidget):
         
         self.init_ui()
         
+        # Initialize the 3 parallel workers
         self.recorder = AudioRecorderWorker()
         self.transcriber = TranscriptionWorker()
-        self.transcriber.caption_ready.connect(self.update_captions)
+        self.translator = TranslationWorker()
+        
+        # Chain the signals: Transcriber -> Translator -> UI
+        self.transcriber.text_ready.connect(self.translator.queue_translation)
+        self.translator.translation_ready.connect(self.update_captions)
         
         self.recorder.start()
         self.transcriber.start()
+        self.translator.start()
 
     def init_ui(self):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
@@ -305,6 +360,7 @@ class OverlayCaptionWindow(QWidget):
         self.zh_animation.stop()
         self.recorder.stop()
         self.transcriber.stop()
+        self.translator.stop()  # Stop the new worker thread
         event.accept()
 
 
