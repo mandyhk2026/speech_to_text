@@ -1,6 +1,7 @@
 import sys
 import time
 import queue
+import re
 import numpy as np
 import soundcard as sc
 import whisper
@@ -331,8 +332,16 @@ class OverlayCaptionWindow(QWidget):
         self.render_history_text()
 
     def render_history_text(self):
-        en_display = self.display_en if self.display_en else "Listening..."
-        zh_display = self.display_zh if self.display_zh else "正在等待音频..."
+        # Helper function to add a line break after punctuation
+        def format_text(text):
+            if not text:
+                return text
+            # This pattern looks for '.', '!', or '?' followed by a space
+            # and replaces it with the punctuation and a newline.
+            return re.sub(r'([.!?])\s+', r'\1\n', text)
+
+        en_display = format_text(self.display_en) if self.display_en else "Listening..."
+        zh_display = format_text(self.display_zh) if self.display_zh else "正在等待音频..."
         
         self.en_label.setText(en_display)
         self.zh_label.setText(zh_display)
