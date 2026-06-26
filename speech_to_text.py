@@ -2,12 +2,26 @@ import sys
 import time
 import queue
 import re
-import numpy as np
-import soundcard as sc
-import whisper
-from deep_translator import GoogleTranslator
-from PySide6.QtCore import Qt, QThread, Signal, Slot, QPoint, QTimer, QVariantAnimation
-from PySide6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget, QScrollArea
+# Wrap third-party imports to catch missing dependencies before the console closes
+try:
+    import numpy as np
+    import soundcard as sc
+    import whisper
+    from deep_translator import GoogleTranslator
+    from PySide6.QtCore import Qt, QThread, Signal, Slot, QPoint, QTimer, QVariantAnimation
+    from PySide6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget, QScrollArea
+except ImportError as e:
+    print("\n" + "="*50)
+    print("DEPENDENCY ERROR: A required library is missing!")
+    print("="*50)
+    print(f"Details: {e}")
+    print("="*50)
+    print("\nPlease run the following command to install dependencies:")
+    print("pip install numpy PySide6 soundcard openai-whisper deep-translator")
+    print("="*50)
+    
+    input("\nPress Enter to close the console...")
+    sys.exit(1)
 
 # --- Configuration ---
 SAMPLE_RATE = 16000
@@ -28,10 +42,10 @@ class AudioRecorderWorker(QThread):
             default_speaker = sc.default_speaker()
             print(f"Active System Speaker: {default_speaker.name}")
             
-            loopback_mic = sc.get_microphone(
-                id=default_speaker.id, 
-                include_loopback=True
-            )
+            # FIX: Use soundcard's built-in string/substring matching by speaker name
+            # This safely targets the correct system loopback device without crashing.
+            loopback_mic = sc.get_microphone(default_speaker.name, include_loopback=True)
+                
             print(f"Successfully hooked loopback onto: {loopback_mic.name}")
 
             with loopback_mic.recorder(samplerate=SAMPLE_RATE, channels=CHANNELS) as recorder:
@@ -71,7 +85,6 @@ class TranslationWorker(QThread):
 
     @Slot(str, bool)
     def queue_translation(self, en_text, is_final):
-        # Clear backed up intermediate translations so we only process the newest
         if not is_final:
             with self.text_queue.mutex:
                 self.text_queue.queue.clear()
@@ -83,13 +96,12 @@ class TranslationWorker(QThread):
             try:
                 en_text, is_final = self.text_queue.get(timeout=0.1)
                 
-                # Skip the network call if the text hasn't actually changed
                 if en_text == self.last_translated_en and not is_final:
                     self.text_queue.task_done()
                     continue
                     
                 try:
-                    zh_text = self.translator.translate(en_text)
+                    zh_text = self.translator.translate(en_text) if en_text.strip() else ""
                     self.last_translated_en = en_text
                 except Exception:
                     zh_text = "[Translation Error]"
@@ -139,7 +151,6 @@ class TranscriptionWorker(QThread):
                             print(f"Lag Alert ({processing_lag:.2f}s). Flushing backlog...")
                             self.phrase_buffer.clear()
                             
-                            # Drain the audio queue
                             while not AUDIO_QUEUE.empty():
                                 try:
                                     AUDIO_QUEUE.get_nowait()
@@ -147,9 +158,8 @@ class TranscriptionWorker(QThread):
                                 except queue.Empty:
                                     break
                                     
-                            self.text_ready.emit(en_text, False)
+                            self.text_ready.emit(en_text, True)  # FIX: Treat as final if forced-flushed
                         else:
-                            # Only emit to the translator if Whisper produced new words
                             if en_text != self.last_en_text:
                                 self.last_en_text = en_text
                                 self.text_ready.emit(en_text, False)
@@ -203,12 +213,10 @@ class OverlayCaptionWindow(QWidget):
         
         self.init_ui()
         
-        # Initialize the 3 parallel workers
         self.recorder = AudioRecorderWorker()
         self.transcriber = TranscriptionWorker()
         self.translator = TranslationWorker()
         
-        # Chain the signals: Transcriber -> Translator -> UI
         self.transcriber.text_ready.connect(self.translator.queue_translation)
         self.translator.translation_ready.connect(self.update_captions)
         
@@ -219,7 +227,6 @@ class OverlayCaptionWindow(QWidget):
     def init_ui(self):
         self.setWindowFlags(Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint | Qt.Tool)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
-        self.setAttribute(Qt.WA_TransparentForMouseEvents, False)
 
         panel_layout = QVBoxLayout()
         panel_layout.setSpacing(10)  
@@ -232,6 +239,7 @@ class OverlayCaptionWindow(QWidget):
         self.en_label.setStyleSheet("color: #FFFFFF; font-size: 32px; font-weight: bold; font-family: 'Segoe UI';")
 
         en_container = QWidget()
+        en_container.setStyleSheet("background: transparent; border: none;")
         en_sub_layout = QVBoxLayout(en_container)
         en_sub_layout.setContentsMargins(0, 0, 0, 0)
         en_sub_layout.addWidget(self.en_label)
@@ -250,6 +258,7 @@ class OverlayCaptionWindow(QWidget):
         self.zh_label.setStyleSheet("color: #FFCC00; font-size: 28px; font-weight: bold; font-family: 'Microsoft YaHei';")
 
         zh_container = QWidget()
+        zh_container.setStyleSheet("background: transparent; border: none;")
         zh_sub_layout = QVBoxLayout(zh_container)
         zh_sub_layout.setContentsMargins(0, 0, 0, 0)
         zh_sub_layout.addWidget(self.zh_label)
@@ -265,10 +274,13 @@ class OverlayCaptionWindow(QWidget):
         panel_layout.addWidget(self.zh_scroll, stretch=1)
 
         self.container = QWidget(self)
+        self.container.setObjectName("MainContainer") # FIX: Set object name to stop global style cascade
         self.container.setLayout(panel_layout)
         self.container.setCursor(Qt.OpenHandCursor)
+        
+        # FIX: Changed generic QWidget rule to targeted #MainContainer rule
         self.container.setStyleSheet("""
-            QWidget {
+            QWidget#MainContainer {
                 background-color: rgba(15, 15, 15, 0.85);
                 border-radius: 12px;
                 border: 1px solid rgba(255, 255, 255, 0.12);
@@ -323,7 +335,7 @@ class OverlayCaptionWindow(QWidget):
         self.render_history_text()
 
         if is_final and (en_text or zh_text):
-            self.clear_timer.start(500)
+            self.clear_timer.start(4000)  # FIX: 500ms was too fast. Upped to 4 seconds.
 
     @Slot()
     def clear_captions(self):
@@ -332,12 +344,9 @@ class OverlayCaptionWindow(QWidget):
         self.render_history_text()
 
     def render_history_text(self):
-        # Helper function to add a line break after punctuation
         def format_text(text):
             if not text:
                 return text
-            # This pattern looks for '.', '!', or '?' followed by a space
-            # and replaces it with the punctuation and a newline.
             return re.sub(r'([.!?])\s+', r'\1\n', text)
 
         en_display = format_text(self.display_en) if self.display_en else "Listening..."
@@ -346,7 +355,10 @@ class OverlayCaptionWindow(QWidget):
         self.en_label.setText(en_display)
         self.zh_label.setText(zh_display)
 
-        QTimer.singleShot(20, self.animate_scroll_bars)
+        # FIX: Explicitly force UI engine updates before setting scroll layout metrics
+        self.en_label.adjustSize()
+        self.zh_label.adjustSize()
+        QTimer.singleShot(30, self.animate_scroll_bars)
 
     def animate_scroll_bars(self):
         en_bar = self.en_scroll.verticalScrollBar()
@@ -369,11 +381,29 @@ class OverlayCaptionWindow(QWidget):
         self.zh_animation.stop()
         self.recorder.stop()
         self.transcriber.stop()
-        self.translator.stop()  # Stop the new worker thread
+        self.translator.stop()
         event.accept()
 
 
 if __name__ == "__main__":
+    # Define a custom exception handler to keep the console open on a crash
+    def console_exception_hook(exctype, value, tb):
+        import traceback
+        print("\n" + "="*50)
+        print("CRITICAL APPLICATION ERROR:")
+        print("="*50)
+        # Print the full error stack trace to the console
+        traceback.print_exception(exctype, value, tb)
+        print("="*50)
+        
+        # This keeps the terminal window open until you manually press Enter
+        input("\nPress Enter to close the console...")
+        sys.exit(1)
+
+    # Register the hook
+    sys.excepthook = console_exception_hook
+
+    # Start the application
     app = QApplication(sys.argv)
     window = OverlayCaptionWindow()
     window.show()
