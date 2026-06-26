@@ -21,7 +21,6 @@ except ImportError as e:
 # --- Real-Time Configuration ---
 SAMPLE_RATE = 16000
 CHANNELS = 2  
-# FIX 1: Reduced from 1.0s to 0.3s. This creates rapid-fire, word-by-word streaming updates.
 BLOCK_SIZE = int(SAMPLE_RATE * 0.3)  
 SILENCE_THRESHOLD = 0.015          
 
@@ -75,8 +74,13 @@ class TranslationWorker(QThread):
 
     @Slot(str, bool)
     def queue_translation(self, en_text, is_final):
-        with self.text_queue.mutex:
-            self.text_queue.queue.clear()
+        # FIX: Thread-safe queue clearing without corrupting internal counters
+        while not self.text_queue.empty():
+            try:
+                self.text_queue.get_nowait()
+                self.text_queue.task_done()
+            except queue.Empty:
+                break
         self.text_queue.put((en_text, is_final))
 
     def run(self):
@@ -85,9 +89,6 @@ class TranslationWorker(QThread):
             try:
                 en_text, is_final = self.text_queue.get(timeout=0.1)
                 
-                # FIX 2: Network Debouncing. 
-                # Wait 300ms to see if a newer word comes in. If it does, skip the network request. 
-                # This stops translation lag from destroying application performance.
                 if not is_final:
                     time.sleep(0.3)
                     if not self.text_queue.empty():
@@ -127,6 +128,7 @@ class TranscriptionWorker(QThread):
         self.phrase_buffer = []  
         self.last_en_text = ""
         self.model = None
+        self.chunk_counter = 0 # Added to throttle interim processing
 
     def run(self):
         print("Loading Whisper model in background...")
@@ -141,8 +143,9 @@ class TranscriptionWorker(QThread):
                 
                 if max_amplitude >= SILENCE_THRESHOLD:
                     self.phrase_buffer.append(chunk)
+                    self.chunk_counter += 1
                     
-                    # 30 chunks of 0.3s = 9 seconds max. Forces snappy CPU inference.
+                    # Force finalize if phrase stretches over 9 seconds
                     if len(self.phrase_buffer) >= 30:
                         combined_audio = np.concatenate(self.phrase_buffer)
                         final_en = self.transcribe_audio(combined_audio)
@@ -150,29 +153,35 @@ class TranscriptionWorker(QThread):
                             self.text_ready.emit(final_en, True)
                         self.phrase_buffer.clear()
                         self.last_en_text = ""
+                        self.chunk_counter = 0
                         AUDIO_QUEUE.task_done()
                         continue
-                        
-                    combined_audio = np.concatenate(self.phrase_buffer)
-                    en_text = self.transcribe_audio(combined_audio)
                     
-                    if en_text:
-                        processing_lag = time.time() - record_time
-                        if processing_lag > 1.5:  # Tightened lag threshold
-                            self.phrase_buffer.clear()
-                            while not AUDIO_QUEUE.empty():
-                                try:
-                                    AUDIO_QUEUE.get_nowait()
-                                    AUDIO_QUEUE.task_done()
-                                except queue.Empty:
-                                    break
-                            self.text_ready.emit(en_text, True)
-                        else:
-                            if en_text != self.last_en_text:
-                                self.last_en_text = en_text
-                                self.text_ready.emit(en_text, False)
+                    # FIX: Only run interim transcription every 3 chunks (~0.9s) 
+                    # to protect the CPU from severe audio processing lag.
+                    if self.chunk_counter % 3 == 0:
+                        combined_audio = np.concatenate(self.phrase_buffer)
+                        en_text = self.transcribe_audio(combined_audio)
                         
+                        if en_text:
+                            processing_lag = time.time() - record_time
+                            if processing_lag > 1.5:  
+                                self.phrase_buffer.clear()
+                                self.chunk_counter = 0
+                                while not AUDIO_QUEUE.empty():
+                                    try:
+                                        AUDIO_QUEUE.get_nowait()
+                                        AUDIO_QUEUE.task_done()
+                                    except queue.Empty:
+                                        break
+                                self.text_ready.emit(en_text, True)
+                            else:
+                                if en_text != self.last_en_text:
+                                    self.last_en_text = en_text
+                                    self.text_ready.emit(en_text, False)
+                    
                 else:
+                    # Silence detected: instantly process whatever is left in the buffer
                     if self.phrase_buffer:
                         combined_audio = np.concatenate(self.phrase_buffer)
                         final_en = self.transcribe_audio(combined_audio)
@@ -181,6 +190,7 @@ class TranscriptionWorker(QThread):
                         
                         self.phrase_buffer.clear()
                         self.last_en_text = ""
+                        self.chunk_counter = 0
                 
                 AUDIO_QUEUE.task_done()
             except queue.Empty:
@@ -217,7 +227,7 @@ class OverlayCaptionWindow(QWidget):
         self.clear_timer.timeout.connect(self.clear_captions)
         
         self.en_animation = QVariantAnimation(self)
-        self.en_animation.setDuration(150) # Faster scroll animation
+        self.en_animation.setDuration(150) 
         self.zh_animation = QVariantAnimation(self)
         self.zh_animation.setDuration(150)
         
@@ -227,8 +237,6 @@ class OverlayCaptionWindow(QWidget):
         self.transcriber = TranscriptionWorker()
         self.translator = TranslationWorker()
         
-        # FIX 3: UI Decoupling.
-        # English updates instantly upon transcription. Translator gets the text simultaneously.
         self.transcriber.text_ready.connect(self.update_english_captions)
         self.transcriber.text_ready.connect(self.translator.queue_translation)
         self.translator.translation_ready.connect(self.update_chinese_captions)
@@ -242,7 +250,7 @@ class OverlayCaptionWindow(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground, True)
 
         panel_layout = QVBoxLayout()
-        panel_layout.setSpacing(10)  
+        panel_layout.setSpacing(5)  
         panel_layout.setContentsMargins(35, 12, 35, 12)
 
         self.en_label = QLabel("Listening...")
@@ -312,13 +320,14 @@ class OverlayCaptionWindow(QWidget):
 
     def resize_and_center(self):
         width = 1200
-        height = 120  # Reduced from 180 to tightly fit 1 line per language
+        height = 130  # Optimized for exactly 1 line per language
         self.setFixedSize(width, height)
         
         screen = QApplication.primaryScreen().geometry()
         x = (screen.width() - width) // 2
         y = screen.height() - height - 60
         self.move(x, y)
+
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -335,7 +344,6 @@ class OverlayCaptionWindow(QWidget):
 
     @Slot(str, bool)
     def update_english_captions(self, en_text, is_final):
-        """Dedicated English updater for zero-latency screen painting."""
         if not is_final:
             self.clear_timer.stop()
 
@@ -347,7 +355,6 @@ class OverlayCaptionWindow(QWidget):
 
     @Slot(str, str, bool)
     def update_chinese_captions(self, en_text, zh_text, is_final):
-        """Dedicated Chinese updater that flows in behind the English."""
         self.display_zh = zh_text
         self.render_history_text()
         
@@ -361,30 +368,13 @@ class OverlayCaptionWindow(QWidget):
         self.render_history_text()
 
     def render_history_text(self):
+        # FIX: Formatter splits sentences and strictly outputs the single latest line
         def format_text(text):
             if not text:
                 return text
-            # Break up the text into sentences based on punctuation
             formatted = re.sub(r'([.!?])\s+', r'\1\n', text)
-            
-            # Split into individual lines and clean up whitespace
             lines = [line.strip() for line in formatted.split('\n') if line.strip()]
-            
-            # Keep only the single most recent sentence
             return lines[-1] if lines else ""
-
-        en_display = format_text(self.display_en) if self.display_en else "Listening..."
-        zh_display = format_text(self.display_zh) if self.display_zh else "正在等待音频..."
-        
-        self.en_label.setText(en_display)
-        self.zh_label.setText(zh_display)
-
-        if self.en_scroll.widget():
-            self.en_scroll.widget().adjustSize()
-        if self.zh_scroll.widget():
-            self.zh_scroll.widget().adjustSize()
-
-        QTimer.singleShot(20, self.animate_scroll_bars)
 
         en_display = format_text(self.display_en) if self.display_en else "Listening..."
         zh_display = format_text(self.display_zh) if self.display_zh else "正在等待音频..."
