@@ -312,14 +312,13 @@ class OverlayCaptionWindow(QWidget):
 
     def resize_and_center(self):
         width = 1200
-        height = 180  
+        height = 120  # Reduced from 180 to tightly fit 1 line per language
         self.setFixedSize(width, height)
         
         screen = QApplication.primaryScreen().geometry()
         x = (screen.width() - width) // 2
         y = screen.height() - height - 60
         self.move(x, y)
-
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.drag_position = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
@@ -365,7 +364,27 @@ class OverlayCaptionWindow(QWidget):
         def format_text(text):
             if not text:
                 return text
-            return re.sub(r'([.!?])\s+', r'\1\n', text)
+            # Break up the text into sentences based on punctuation
+            formatted = re.sub(r'([.!?])\s+', r'\1\n', text)
+            
+            # Split into individual lines and clean up whitespace
+            lines = [line.strip() for line in formatted.split('\n') if line.strip()]
+            
+            # Keep only the single most recent sentence
+            return lines[-1] if lines else ""
+
+        en_display = format_text(self.display_en) if self.display_en else "Listening..."
+        zh_display = format_text(self.display_zh) if self.display_zh else "正在等待音频..."
+        
+        self.en_label.setText(en_display)
+        self.zh_label.setText(zh_display)
+
+        if self.en_scroll.widget():
+            self.en_scroll.widget().adjustSize()
+        if self.zh_scroll.widget():
+            self.zh_scroll.widget().adjustSize()
+
+        QTimer.singleShot(20, self.animate_scroll_bars)
 
         en_display = format_text(self.display_en) if self.display_en else "Listening..."
         zh_display = format_text(self.display_zh) if self.display_zh else "正在等待音频..."
